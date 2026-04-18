@@ -35,18 +35,23 @@ cargo build --release
 
 ## Benchmarks
 
-Sequential stdio MCP workload, 100 stores + 100 retrieves each, fresh DB per run, ONNX model already cached on disk. Measured on an Apple Silicon Mac, single client, no concurrency.
+Sequential stdio MCP workload, 100 stores + 100 retrieves each, fresh DB per run, ONNX model + weights already warm on disk. Measured on an Apple Silicon Mac, single client, no concurrency.
 
-| Metric        | Python upstream | Rust port   | Ratio            |
-|---------------|-----------------|-------------|------------------|
-| cold-start    | 4475 ms         | **123 ms**  | **36× faster**   |
-| RSS (live)    | 576 MB          | **242 MB**  | **2.4× smaller** |
-| store p50     | 13.7 ms         | 12.5 ms     | 1.1× faster      |
-| store p95     | 43.0 ms         | 29.5 ms     | 1.5× faster      |
-| retrieve p50  | **6.8 ms**      | 22.6 ms     | 0.3× (Rust slower) |
-| retrieve p95  | **8.5 ms**      | 36.4 ms     | 0.2× (Rust slower) |
+| Metric        | Python upstream | Rust port    | Ratio             |
+|---------------|-----------------|--------------|-------------------|
+| cold-start    | 3619 ms         | **68 ms**    | **53× faster**    |
+| RSS (live)    | 561 MB          | **241 MB**   | **2.3× smaller**  |
+| store p50     | 10.3 ms         | **8.5 ms**   | 1.2× faster       |
+| store p95     | 11.5 ms         | **8.7 ms**   | 1.3× faster       |
+| retrieve p50  | **7.0 ms**      | 8.8 ms       | 0.8× (20% slower) |
+| retrieve p95  | **7.7 ms**      | 9.2 ms       | 0.8×              |
 
-The retrieve regression is tracked — current suspect is the 3× KNN oversampling we do to guarantee `n_results` alive rows even when some matches are soft-deleted. Reproduce locally with `scripts/bench.py`.
+Rust wins decisively on cold-start and memory footprint and matches or beats Python on writes. Retrieve is ~20% slower per-call but p95 is tighter (more predictable). Reproduce locally with `scripts/bench.py`.
+
+Two key tunings got us here:
+
+- **Conditional KNN oversampling.** The original code always asked sqlite-vec for `3 × n_results` rows to protect against tombstoned matches. That doubled per-call latency on fresh DBs. We now probe `memories.deleted_at IS NOT NULL LIMIT 1` (index-backed, microseconds) and only oversample when soft-deletes exist.
+- **`intra_threads = 4`** for the ONNX Runtime session. The default `available_parallelism()` spawns one worker per core, which on 10-core Apple Silicon spends more time dispatching than computing for single-sentence embeddings. Forcing 4 threads matches typical Python defaults and cut retrieve p50 from 22 ms to 8 ms.
 
 ## Parity with upstream
 

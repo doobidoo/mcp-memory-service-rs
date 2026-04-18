@@ -21,17 +21,16 @@ use ort::{
 use serde::Deserialize;
 
 fn build_session(model_path: &Path) -> Result<Session> {
+    // 4 intra-op threads is a sensible middle ground: matches typical Python
+    // ONNX Runtime defaults on 4+ core machines, keeps per-call latency
+    // predictable, and avoids the thread-pool dispatch overhead seen with
+    // available_parallelism() on 10+ core chips for tiny single-sentence
+    // workloads.
     Session::builder()
         .and_then(|b| b.with_optimization_level(GraphOptimizationLevel::Level3))
-        .and_then(|b| b.with_intra_threads(num_cpus_one()))
+        .and_then(|b| b.with_intra_threads(4))
         .and_then(|b| b.commit_from_file(model_path))
         .map_err(|e| AppError::Config(format!("ort session: {e}")))
-}
-
-fn num_cpus_one() -> usize {
-    std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1)
 }
 use sha2::{Digest, Sha256};
 use tokenizers::Tokenizer;

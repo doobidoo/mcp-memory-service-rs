@@ -314,11 +314,29 @@ pub fn knn_search(
         )));
     }
     let q_bytes = bytemuck_f32_slice_as_bytes(query_embedding);
-    // We declared the vec0 table with `distance_metric=cosine`, so the
-    // returned `distance` is cosine distance (1 - cos) directly. Similarity
-    // is simply `1 - distance`. Oversample 3x then truncate after the
-    // soft-delete filter so KNN never gives us fewer than n_results alive
-    // rows when some matches are tombstoned.
+    // vec0 with `distance_metric=cosine` returns cosine distance (1 - cos),
+    // so similarity = 1 - distance.
+    //
+    // Oversampling nuance: sqlite-vec's `k` is requested before our
+    // `deleted_at IS NULL` filter kicks in, so on a DB with tombstoned
+    // matches we could be left with fewer than `n_results` alive rows.
+    // Always-3x was the original fix but doubled retrieve latency vs the
+    // Python upstream on fresh DBs. Cheaper path: one index-backed probe
+    // tells us whether any soft-deleted rows exist at all; if not, ask for
+    // exactly `n_results` and skip the extra work.
+    let has_soft_deleted: bool = conn
+        .query_row(
+            "SELECT 1 FROM memories WHERE deleted_at IS NOT NULL LIMIT 1",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .is_ok();
+    let k = if has_soft_deleted {
+        (n_results as i64).saturating_mul(3).max(n_results as i64)
+    } else {
+        n_results as i64
+    };
+
     let mut stmt = conn.prepare(
         "SELECT m.content, m.content_hash, m.tags, m.memory_type, m.metadata,
                 m.created_at, m.created_at_iso, m.updated_at, m.updated_at_iso,
@@ -330,9 +348,8 @@ pub fn knn_search(
             AND k = ?2
           ORDER BY me.distance",
     )?;
-    let oversample = (n_results as i64).saturating_mul(3).max(n_results as i64);
     let rows = stmt
-        .query_map(params![q_bytes, oversample], |r| {
+        .query_map(params![q_bytes, k], |r| {
             let distance: f32 = r.get("distance")?;
             let mem = row_from_sqlite(r)?;
             Ok((mem, distance))
