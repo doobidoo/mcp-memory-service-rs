@@ -246,13 +246,30 @@ impl MemoryServer {
         Parameters(p): Parameters<RetrieveMemoryParams>,
     ) -> std::result::Result<CallToolResult, ErrorData> {
         self.stats.record(|s| &s.retrieve_count);
+        // Per-phase timing when MMS_PROFILE is set. Zero-cost when unset
+        // (skipped by the Option branch). Left in because retrieve is the
+        // metric we're most sensitive about vs the Python upstream — any
+        // regression in this tool is a real concern.
+        let profile_t0 = std::env::var("MMS_PROFILE").is_ok().then(std::time::Instant::now);
         let query_emb = {
             let mut emb = self.embedder.lock().await;
             emb.embed(&p.query).await.map_err(internal_err)?
         };
+        let profile_t1 = profile_t0.as_ref().map(|_| std::time::Instant::now());
         let conn = self.conn.lock().await;
+        let profile_t2 = profile_t0.as_ref().map(|_| std::time::Instant::now());
         let hits =
             storage::knn_search(&conn, &query_emb, p.n_results.max(1)).map_err(internal_err)?;
+        if let (Some(t0), Some(t1), Some(t2)) = (profile_t0, profile_t1, profile_t2) {
+            let t3 = std::time::Instant::now();
+            eprintln!(
+                "retrieve profile: embed={:?} lock={:?} knn={:?} total={:?}",
+                t1 - t0,
+                t2 - t1,
+                t3 - t2,
+                t3 - t0
+            );
+        }
         let results: Vec<RetrievedMemory> = hits
             .into_iter()
             .map(|(mem, score)| RetrievedMemory {

@@ -1,6 +1,6 @@
 [package]
 name = "mcp-memory-service"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Schema-compatible Rust drop-in for the core tools of mcp-memory-service"
 license = "PolyForm-Noncommercial-1.0.0"

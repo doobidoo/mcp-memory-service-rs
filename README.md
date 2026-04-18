@@ -62,6 +62,10 @@ Two test suites verify Rust ↔ Python compatibility:
 
 Both suites run on every push via GitHub Actions (`.github/workflows/ci.yml`).
 
+## Versioning and releases
+
+This project follows [Semantic Versioning 2.0.0](https://semver.org/spec/v2.0.0.html). What counts as what is defined in [CHANGELOG.md](CHANGELOG.md) — briefly: MAJOR on schema or wire-shape breakage, MINOR on new tools or optional fields, PATCH on fixes and perf work. Every release has a corresponding entry in the changelog and a GitHub release with the same notes.
+
 ## License
 
 This Rust port is dual-licensed:
