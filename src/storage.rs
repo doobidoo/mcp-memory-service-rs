@@ -314,3 +314,212 @@ pub fn knn_search(
     Ok(out)
 }
 
+/// How multi-tag queries combine.
+#[derive(Debug, Clone, Copy)]
+pub enum TagMatch {
+    Any,
+    All,
+}
+
+impl TagMatch {
+    pub fn parse(s: &str) -> Self {
+        if s.eq_ignore_ascii_case("all") {
+            TagMatch::All
+        } else {
+            TagMatch::Any
+        }
+    }
+}
+
+/// Build a `(...)` SQL fragment that realizes Python's tag-GLOB semantics:
+///   (',' || REPLACE(tags, ' ', '') || ',') GLOB '*,<tag>,*'
+/// ANDed or ORed per `mode`. Returns the fragment and bind values. The
+/// caller is responsible for splicing the fragment into its own WHERE.
+fn tag_where_clause(tags: &[String], mode: TagMatch) -> (String, Vec<String>) {
+    if tags.is_empty() {
+        return ("1=1".into(), Vec::new());
+    }
+    let op = match mode {
+        TagMatch::Any => " OR ",
+        TagMatch::All => " AND ",
+    };
+    let clauses: Vec<&str> = tags
+        .iter()
+        .map(|_| "(',' || REPLACE(tags, ' ', '') || ',') GLOB ?")
+        .collect();
+    let patterns: Vec<String> = tags.iter().map(|t| format!("*,{},*", t.trim())).collect();
+    (format!("({})", clauses.join(op)), patterns)
+}
+
+/// Tag-filtered search, soft-delete aware. Case-sensitive exact-tag matching.
+pub fn search_by_tag(
+    conn: &Connection,
+    tags: &[String],
+    mode: TagMatch,
+    memory_type: Option<&str>,
+) -> Result<Vec<MemoryRow>> {
+    let (tag_clause, tag_binds) = tag_where_clause(tags, mode);
+    let mut sql = format!(
+        "SELECT content, content_hash, tags, memory_type, metadata,
+                created_at, created_at_iso, updated_at, updated_at_iso
+           FROM memories
+          WHERE deleted_at IS NULL
+            AND {tag_clause}"
+    );
+    if memory_type.is_some() {
+        sql.push_str(" AND memory_type = ?");
+    }
+    sql.push_str(" ORDER BY created_at DESC");
+
+    let mut stmt = conn.prepare(&sql)?;
+    let mut binds: Vec<Box<dyn rusqlite::ToSql>> = tag_binds
+        .into_iter()
+        .map(|s| Box::new(s) as Box<dyn rusqlite::ToSql>)
+        .collect();
+    if let Some(mt) = memory_type {
+        binds.push(Box::new(mt.to_string()));
+    }
+    let bind_refs: Vec<&dyn rusqlite::ToSql> = binds.iter().map(|b| b.as_ref()).collect();
+    let rows = stmt
+        .query_map(bind_refs.as_slice(), row_from_sqlite)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// Accepts an ISO8601 string or a float-as-string and returns the epoch. Used
+/// for the `before` / `after` filters on delete + retrieval queries so that
+/// clients can pass either format, matching Python's permissive behavior.
+pub fn parse_time(raw: &str) -> Result<f64> {
+    if let Ok(v) = raw.parse::<f64>() {
+        return Ok(v);
+    }
+    chrono::DateTime::parse_from_rfc3339(raw)
+        .map(|d| d.timestamp_millis() as f64 / 1000.0)
+        .map_err(|e| AppError::Schema(format!("could not parse timestamp {raw:?}: {e}")))
+}
+
+/// Filter spec for `delete_memory` — mirrors the Python tool signature.
+#[derive(Debug, Default)]
+pub struct DeleteFilter {
+    pub content_hash: Option<String>,
+    pub tags: Vec<String>,
+    pub tag_match: TagMatch,
+    pub before: Option<f64>,
+    pub after: Option<f64>,
+    pub memory_type: Option<String>,
+}
+
+impl Default for TagMatch {
+    fn default() -> Self {
+        TagMatch::Any
+    }
+}
+
+fn build_delete_where(filter: &DeleteFilter) -> (String, Vec<Box<dyn rusqlite::ToSql>>) {
+    let mut parts: Vec<String> = vec!["deleted_at IS NULL".into()];
+    let mut binds: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+    if let Some(hash) = &filter.content_hash {
+        parts.push("content_hash = ?".into());
+        binds.push(Box::new(hash.clone()));
+    }
+    if !filter.tags.is_empty() {
+        let (clause, tag_binds) = tag_where_clause(&filter.tags, filter.tag_match);
+        parts.push(clause);
+        for t in tag_binds {
+            binds.push(Box::new(t));
+        }
+    }
+    if let Some(b) = filter.before {
+        parts.push("created_at < ?".into());
+        binds.push(Box::new(b));
+    }
+    if let Some(a) = filter.after {
+        parts.push("created_at > ?".into());
+        binds.push(Box::new(a));
+    }
+    if let Some(mt) = &filter.memory_type {
+        parts.push("memory_type = ?".into());
+        binds.push(Box::new(mt.clone()));
+    }
+    (parts.join(" AND "), binds)
+}
+
+/// Soft-delete every matching memory (unless `dry_run`). Returns the content
+/// hashes that were (would have been) affected. Setting `deleted_at` — no
+/// physical `DELETE FROM` — so data is recoverable.
+pub fn soft_delete(conn: &Connection, filter: &DeleteFilter, dry_run: bool) -> Result<Vec<String>> {
+    let (where_clause, binds) = build_delete_where(filter);
+    let bind_refs: Vec<&dyn rusqlite::ToSql> = binds.iter().map(|b| b.as_ref()).collect();
+
+    let select_sql = format!("SELECT content_hash FROM memories WHERE {where_clause}");
+    let mut stmt = conn.prepare(&select_sql)?;
+    let hashes: Vec<String> = stmt
+        .query_map(bind_refs.as_slice(), |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    if dry_run || hashes.is_empty() {
+        return Ok(hashes);
+    }
+
+    let now = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
+    let update_sql = format!("UPDATE memories SET deleted_at = ? WHERE {where_clause}");
+    let mut update_binds: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(now)];
+    update_binds.extend(binds);
+    let update_refs: Vec<&dyn rusqlite::ToSql> =
+        update_binds.iter().map(|b| b.as_ref()).collect();
+    conn.execute(&update_sql, update_refs.as_slice())?;
+    Ok(hashes)
+}
+
+/// Paginated listing with optional tag + memory_type filters. The `tag`
+/// argument is singular and — per SPEC §11-Q4 — reuses the exact GLOB
+/// semantics of `search_by_tag` with a single-element vec in `any` mode.
+pub fn list_memories(
+    conn: &Connection,
+    page: i64,
+    page_size: i64,
+    tag: Option<&str>,
+    memory_type: Option<&str>,
+) -> Result<(Vec<MemoryRow>, i64)> {
+    let page = page.max(1);
+    let page_size = page_size.max(1);
+
+    let mut where_parts: Vec<String> = vec!["deleted_at IS NULL".into()];
+    let mut binds: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+    if let Some(t) = tag {
+        let (clause, tag_binds) = tag_where_clause(&[t.to_string()], TagMatch::Any);
+        where_parts.push(clause);
+        for p in tag_binds {
+            binds.push(Box::new(p));
+        }
+    }
+    if let Some(mt) = memory_type {
+        where_parts.push("memory_type = ?".into());
+        binds.push(Box::new(mt.to_string()));
+    }
+    let where_clause = where_parts.join(" AND ");
+
+    let count_sql = format!("SELECT COUNT(*) FROM memories WHERE {where_clause}");
+    let bind_refs: Vec<&dyn rusqlite::ToSql> = binds.iter().map(|b| b.as_ref()).collect();
+    let total: i64 = conn.query_row(&count_sql, bind_refs.as_slice(), |r| r.get(0))?;
+
+    let list_sql = format!(
+        "SELECT content, content_hash, tags, memory_type, metadata,
+                created_at, created_at_iso, updated_at, updated_at_iso
+           FROM memories
+          WHERE {where_clause}
+          ORDER BY created_at DESC
+          LIMIT ? OFFSET ?"
+    );
+    let offset = (page - 1) * page_size;
+    let mut all_binds: Vec<Box<dyn rusqlite::ToSql>> = binds;
+    all_binds.push(Box::new(page_size));
+    all_binds.push(Box::new(offset));
+    let all_refs: Vec<&dyn rusqlite::ToSql> = all_binds.iter().map(|b| b.as_ref()).collect();
+    let mut stmt = conn.prepare(&list_sql)?;
+    let rows = stmt
+        .query_map(all_refs.as_slice(), row_from_sqlite)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok((rows, total))
+}
+

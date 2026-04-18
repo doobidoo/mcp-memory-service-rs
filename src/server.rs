@@ -12,7 +12,7 @@ use tokio::sync::Mutex;
 
 use crate::config::Config;
 use crate::embeddings::Embedder;
-use crate::storage::{self, MemoryRow};
+use crate::storage::{self, DeleteFilter, MemoryRow, TagMatch};
 
 pub struct MemoryServer {
     #[allow(dead_code)]
@@ -80,6 +80,80 @@ pub struct RetrievedMemory {
     pub memory: MemoryRow,
     pub relevance_score: f32,
     pub debug_info: serde_json::Value,
+}
+
+// ---------- search_by_tag ----------
+
+fn default_tag_match() -> String {
+    "any".into()
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SearchByTagParams {
+    pub tags: Vec<String>,
+    #[serde(default = "default_tag_match")]
+    pub tag_match: String,
+    #[serde(default)]
+    pub memory_type: Option<String>,
+}
+
+// ---------- delete_memory ----------
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct DeleteMemoryParams {
+    #[serde(default)]
+    pub content_hash: Option<String>,
+    #[serde(default)]
+    pub tags: Option<Vec<String>>,
+    #[serde(default = "default_tag_match")]
+    pub tag_match: String,
+    #[serde(default)]
+    pub before: Option<String>,
+    #[serde(default)]
+    pub after: Option<String>,
+    #[serde(default)]
+    pub memory_type: Option<String>,
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DeleteMemoryResult {
+    pub success: bool,
+    pub deleted_count: usize,
+    pub deleted_hashes: Vec<String>,
+    pub dry_run: bool,
+}
+
+// ---------- list_memories ----------
+
+fn default_page() -> i64 {
+    1
+}
+fn default_page_size() -> i64 {
+    10
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ListMemoriesParams {
+    #[serde(default = "default_page")]
+    pub page: i64,
+    #[serde(default = "default_page_size")]
+    pub page_size: i64,
+    #[serde(default)]
+    pub tag: Option<String>,
+    #[serde(default)]
+    pub memory_type: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ListMemoriesResult {
+    pub memories: Vec<MemoryRow>,
+    pub total: i64,
+    pub page: i64,
+    pub page_size: i64,
+    pub total_pages: i64,
+    pub has_more: bool,
 }
 
 // ---------- impl ----------
@@ -171,6 +245,108 @@ impl MemoryServer {
             .collect();
         json_result(&results)
     }
+
+    #[tool(
+        name = "search_by_tag",
+        description = "Return memories whose tags match. Tag matching is case-sensitive; \
+                       multi-tag queries use 'any' (OR) or 'all' (AND)."
+    )]
+    async fn search_by_tag(
+        &self,
+        Parameters(p): Parameters<SearchByTagParams>,
+    ) -> std::result::Result<CallToolResult, ErrorData> {
+        let mode = TagMatch::parse(&p.tag_match);
+        let conn = self.conn.lock().await;
+        let rows = storage::search_by_tag(&conn, &p.tags, mode, p.memory_type.as_deref())
+            .map_err(internal_err)?;
+        json_result(&rows)
+    }
+
+    #[tool(
+        name = "delete_memory",
+        description = "Soft-delete memories matching the given filter. Pass dry_run=true to \
+                       preview. Supports content_hash, tags, memory_type, and before/after \
+                       ISO8601 or epoch timestamps."
+    )]
+    async fn delete_memory(
+        &self,
+        Parameters(p): Parameters<DeleteMemoryParams>,
+    ) -> std::result::Result<CallToolResult, ErrorData> {
+        let mode = TagMatch::parse(&p.tag_match);
+        let before = p.before.as_deref().map(storage::parse_time).transpose()
+            .map_err(internal_err)?;
+        let after = p.after.as_deref().map(storage::parse_time).transpose()
+            .map_err(internal_err)?;
+
+        // If no selectors were provided, refuse — matches Python's safety
+        // behavior of not mass-deleting on an empty filter.
+        if p.content_hash.is_none()
+            && p.tags.as_ref().map(|v| v.is_empty()).unwrap_or(true)
+            && before.is_none()
+            && after.is_none()
+            && p.memory_type.is_none()
+        {
+            return Err(internal_err(
+                "delete_memory requires at least one selector (content_hash, tags, \
+                 memory_type, before, or after)",
+            ));
+        }
+
+        let filter = DeleteFilter {
+            content_hash: p.content_hash,
+            tags: p.tags.unwrap_or_default(),
+            tag_match: mode,
+            before,
+            after,
+            memory_type: p.memory_type,
+        };
+        let conn = self.conn.lock().await;
+        let hashes = storage::soft_delete(&conn, &filter, p.dry_run).map_err(internal_err)?;
+        let result = DeleteMemoryResult {
+            success: true,
+            deleted_count: hashes.len(),
+            deleted_hashes: hashes,
+            dry_run: p.dry_run,
+        };
+        json_result(&result)
+    }
+
+    #[tool(
+        name = "list_memories",
+        description = "Paginated listing of memories, ordered newest-first, with optional \
+                       single-tag filter and memory_type filter."
+    )]
+    async fn list_memories(
+        &self,
+        Parameters(p): Parameters<ListMemoriesParams>,
+    ) -> std::result::Result<CallToolResult, ErrorData> {
+        let conn = self.conn.lock().await;
+        let (rows, total) = storage::list_memories(
+            &conn,
+            p.page,
+            p.page_size,
+            p.tag.as_deref(),
+            p.memory_type.as_deref(),
+        )
+        .map_err(internal_err)?;
+        let page = p.page.max(1);
+        let page_size = p.page_size.max(1);
+        let total_pages = if page_size > 0 {
+            (total as f64 / page_size as f64).ceil() as i64
+        } else {
+            0
+        };
+        let has_more = page * page_size < total;
+        let result = ListMemoriesResult {
+            memories: rows,
+            total,
+            page,
+            page_size,
+            total_pages,
+            has_more,
+        };
+        json_result(&result)
+    }
 }
 
 fn normalize_tags(
@@ -231,9 +407,9 @@ impl ServerHandler for MemoryServer {
             Implementation::new(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
         info.capabilities = ServerCapabilities::builder().enable_tools().build();
         info.instructions = Some(
-            "Rust port of mcp-memory-service. M1 wired: store_memory, retrieve_memory, ping. \
-             Remaining tools (search_by_tag, delete_memory, list_memories, check_database_health, \
-             get_cache_stats) arrive in M2/M3."
+            "Rust port of mcp-memory-service. M2 wired: ping, store_memory, retrieve_memory, \
+             search_by_tag, delete_memory, list_memories. Remaining tools \
+             (check_database_health, get_cache_stats) arrive in M3."
                 .into(),
         );
         info
