@@ -313,10 +313,19 @@ Clients that grep these fields keep working. Document honestly in README that Ru
 
 ## 12. Milestones
 
-- **M0 Scaffold (1 evening):** Cargo project, rmcp stdio hello-world, SQLite open with pragmas, schema migration.
+- **M0 Scaffold — ✅ done (commit `0e39a2e`, 2026-04-17):** Cargo project, rmcp 1.5 stdio server with stub `ping` tool, SQLite open with pragmas per §4, schema migration including sqlite-vec `vec0` virtual table, `verify` subcommand. Clean build, stdio handshake verified end-to-end (initialize → tools/list → EOF shutdown).
 - **M1 Store + Retrieve (1 weekend):** ONNX model load, embed, write to vec0, cosine KNN. Manual verify.
 - **M2 Tag search + Delete + List (1 evening):** GLOB logic, soft-delete, pagination.
 - **M3 Health + Cache stats + external API fallback (1 evening):** The rest of the surface.
 - **M4 Parity test suite (1 weekend):** Python↔Rust behavior table from §7, run both against same DB, assert identical JSON responses. This is the ship gate.
 
 Total realistic effort with Opus pair: **2–3 weekends.**
+
+## 13. Change Log
+
+- **2026-04-17 — SPEC v0.1** drafted.
+- **2026-04-17 — Upstream bug filed:** `list_memories` return-shape docstring drift → [doobidoo/mcp-memory-service#731](https://github.com/doobidoo/mcp-memory-service/pull/731). §3.5 and §11-Q4 updated to reflect real shape (`total`, `total_pages`, `has_more`).
+- **2026-04-17 — M0 landed:** scaffold commit `0e39a2e`. Deviations from §9 dep list:
+  - `schemars` pinned to `"1"` (rmcp 1.5 requires schemars 1.x; the examples-era docs referenced 0.8).
+  - `ort` deferred to M1 — `2.0.0-rc.12` fails to compile on macOS (`src/ep/vitis.rs` references a non-existent `OrtApi` field). M1 will pin to `=2.0.0-rc.10` or evaluate `candle-core` + `candle-transformers` as an alternative.
+  - `tokenizers`, `ndarray` deferred along with `ort` (only needed once embeddings are wired).
