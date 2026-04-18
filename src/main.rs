@@ -5,6 +5,7 @@ use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
 mod config;
+mod embeddings;
 mod error;
 mod server;
 mod storage;
@@ -29,6 +30,13 @@ enum Command {
         /// Override MCP_MEMORY_DB_PATH for this invocation.
         #[arg(long)]
         db: Option<PathBuf>,
+    },
+
+    /// Load the ONNX model and embed a single string. Smoke-tests the
+    /// full embedding pipeline (download + tokenize + inference + pool).
+    Embed {
+        /// Text to embed.
+        text: String,
     },
 }
 
@@ -55,8 +63,33 @@ async fn main() -> Result<()> {
             }
             run_verify(&config)?;
         }
+        Command::Embed { text } => {
+            run_embed(&text).await?;
+        }
     }
 
+    Ok(())
+}
+
+async fn run_embed(text: &str) -> Result<()> {
+    let t0 = std::time::Instant::now();
+    let mut embedder = embeddings::Embedder::load().await.context("load model")?;
+    let load_ms = t0.elapsed().as_millis();
+
+    let t1 = std::time::Instant::now();
+    let vec = embedder.embed(text).context("embed")?;
+    let embed_ms = t1.elapsed().as_millis();
+
+    let norm = vec.iter().map(|v| v * v).sum::<f32>().sqrt();
+    let head: Vec<String> = vec.iter().take(5).map(|v| format!("{v:.4}")).collect();
+
+    println!("mcp-memory-service-rs embed ✓");
+    println!("  text        : {text:?}");
+    println!("  load model  : {load_ms} ms");
+    println!("  embed time  : {embed_ms} ms");
+    println!("  dim         : {}", vec.len());
+    println!("  L2 norm     : {norm:.6}");
+    println!("  first 5     : [{}]", head.join(", "));
     Ok(())
 }
 

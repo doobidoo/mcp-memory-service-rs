@@ -314,7 +314,7 @@ Clients that grep these fields keep working. Document honestly in README that Ru
 ## 12. Milestones
 
 - **M0 Scaffold — ✅ done (commit `0e39a2e`, 2026-04-17):** Cargo project, rmcp 1.5 stdio server with stub `ping` tool, SQLite open with pragmas per §4, schema migration including sqlite-vec `vec0` virtual table, `verify` subcommand. Clean build, stdio handshake verified end-to-end (initialize → tools/list → EOF shutdown).
-- **M1 Store + Retrieve (1 weekend):** ONNX model load, embed, write to vec0, cosine KNN. Manual verify.
+- **M1 Store + Retrieve — ✅ done (2026-04-18):** ONNX model load via `ort` 2.0.0-rc.10 + `download-binaries` (self-contained static link, no system ONNX runtime required), `all-MiniLM-L6-v2` auto-download + SHA256 verify + safe tar extract into Python-compatible cache path, mean-pool with attention mask + L2 normalize. `store_memory` and `retrieve_memory` MCP tools wired. New `embed` subcommand for pipeline smoke test. Verified end-to-end: stored 3 memories, queried "compiled programming languages" → Rust first (0.56), "tropical fruits" → Bananas first (0.59). Warm cold-start: **114 ms** model load, **~11 ms** per embed.
 - **M2 Tag search + Delete + List (1 evening):** GLOB logic, soft-delete, pagination.
 - **M3 Health + Cache stats + external API fallback (1 evening):** The rest of the surface.
 - **M4 Parity test suite (1 weekend):** Python↔Rust behavior table from §7, run both against same DB, assert identical JSON responses. This is the ship gate.
@@ -329,3 +329,5 @@ Total realistic effort with Opus pair: **2–3 weekends.**
   - `schemars` pinned to `"1"` (rmcp 1.5 requires schemars 1.x; the examples-era docs referenced 0.8).
   - `ort` deferred to M1 — `2.0.0-rc.12` fails to compile on macOS (`src/ep/vitis.rs` references a non-existent `OrtApi` field). M1 will pin to `=2.0.0-rc.10` or evaluate `candle-core` + `candle-transformers` as an alternative.
   - `tokenizers`, `ndarray` deferred along with `ort` (only needed once embeddings are wired).
+- **2026-04-17 — Upstream merged:** PR #731 shipped in `doobidoo/mcp-memory-service` v10.38.3.
+- **2026-04-18 — M1 landed:** `ort` pinned to `=2.0.0-rc.10` with features `["std", "download-binaries", "ndarray"]` — self-contained binary, no system ONNX runtime required. Noted concurrency nuance: rmcp dispatches tool calls on independent tasks, so a client firing `store_memory` and `retrieve_memory` back-to-back without awaiting the first response can see a race. Real MCP clients await responses sequentially, so this is a test-harness artifact rather than a prod bug — documented here so M4 parity tests don't get surprised.
