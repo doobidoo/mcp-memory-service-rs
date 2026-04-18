@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 
 use ndarray::{Array, Array2, Axis};
 use ort::{
-    session::{Session, builder::GraphOptimizationLevel},
+    session::{builder::GraphOptimizationLevel, Session},
     value::{Tensor, Value},
 };
 use serde::Deserialize;
@@ -41,10 +41,8 @@ use crate::error::{AppError, Result};
 
 pub const MODEL_NAME: &str = "all-MiniLM-L6-v2";
 pub const EMBEDDING_DIM: usize = 384;
-const MODEL_URL: &str =
-    "https://chroma-onnx-models.s3.amazonaws.com/all-MiniLM-L6-v2/onnx.tar.gz";
-const MODEL_SHA256: &str =
-    "913d7300ceae3b2dbc2c50d1de4baacab4be7b9380491c27fab7418616a16ec3";
+const MODEL_URL: &str = "https://chroma-onnx-models.s3.amazonaws.com/all-MiniLM-L6-v2/onnx.tar.gz";
+const MODEL_SHA256: &str = "913d7300ceae3b2dbc2c50d1de4baacab4be7b9380491c27fab7418616a16ec3";
 
 pub enum Embedder {
     Onnx(OnnxEmbedder),
@@ -112,7 +110,11 @@ impl OnnxEmbedder {
             .map_err(|e| AppError::Config(format!("tokenize failed: {e}")))?;
 
         let batch = encodings.len();
-        let max_len = encodings.iter().map(|e| e.get_ids().len()).max().unwrap_or(0);
+        let max_len = encodings
+            .iter()
+            .map(|e| e.get_ids().len())
+            .max()
+            .unwrap_or(0);
         if max_len == 0 {
             return Err(AppError::Config("tokenizer produced empty batch".into()));
         }
@@ -229,7 +231,8 @@ async fn ensure_model() -> Result<ModelPaths> {
     fs::create_dir_all(&root)?;
     let archive_path = root.join("onnx.tar.gz");
 
-    let archive_ok = archive_path.exists() && verify_sha256(&archive_path, MODEL_SHA256).unwrap_or(false);
+    let archive_ok =
+        archive_path.exists() && verify_sha256(&archive_path, MODEL_SHA256).unwrap_or(false);
     if !archive_ok {
         tracing::info!(url = MODEL_URL, "downloading onnx model");
         let bytes = reqwest::get(MODEL_URL)
@@ -292,13 +295,12 @@ struct ExternalEmbedding {
 
 impl ExternalEmbedder {
     pub fn new(config: &Config) -> Result<Self> {
-        let url = config
-            .external_api_url
-            .clone()
-            .ok_or_else(|| AppError::Config(
+        let url = config.external_api_url.clone().ok_or_else(|| {
+            AppError::Config(
                 "MCP_EXTERNAL_EMBEDDING_API_URL is required when MCP_EMBEDDING_BACKEND=external"
                     .into(),
-            ))?;
+            )
+        })?;
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
             .build()

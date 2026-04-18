@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::sync::Once;
 
-use rusqlite::{Connection, params};
+use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
@@ -28,12 +28,10 @@ static VEC_INIT: Once = Once::new();
 /// connection loads vec0 transparently. Safe to call more than once —
 /// the Once guard enforces single registration.
 pub fn register_sqlite_vec() {
-    VEC_INIT.call_once(|| {
-        unsafe {
-            rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute(
-                sqlite_vec::sqlite3_vec_init as *const (),
-            )));
-        }
+    VEC_INIT.call_once(|| unsafe {
+        rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute(
+            sqlite_vec::sqlite3_vec_init as *const (),
+        )));
     });
 }
 
@@ -63,7 +61,10 @@ fn apply_pragmas(conn: &Connection, config: &Config) -> Result<()> {
     ];
 
     for (k, v) in &config.sqlite_pragmas {
-        if let Some(slot) = pragmas.iter_mut().find(|(kk, _)| kk.eq_ignore_ascii_case(k)) {
+        if let Some(slot) = pragmas
+            .iter_mut()
+            .find(|(kk, _)| kk.eq_ignore_ascii_case(k))
+        {
             slot.1 = v.clone();
         } else {
             pragmas.push((Box::leak(k.clone().into_boxed_str()), v.clone()));
@@ -174,11 +175,7 @@ fn now_epoch_iso() -> (f64, String) {
 
 /// Insert a memory + its embedding. Idempotent: if the content_hash already
 /// exists (alive or soft-deleted), returns `Ok(None)` without mutating.
-pub fn insert_memory(
-    conn: &Connection,
-    row: &MemoryRow,
-    embedding: &[f32],
-) -> Result<Option<i64>> {
+pub fn insert_memory(conn: &Connection, row: &MemoryRow, embedding: &[f32]) -> Result<Option<i64>> {
     if embedding.len() != EMBEDDING_DIM {
         return Err(AppError::Schema(format!(
             "embedding dim mismatch: got {}, expected {EMBEDDING_DIM}",
@@ -290,9 +287,13 @@ fn row_from_sqlite(r: &rusqlite::Row) -> rusqlite::Result<MemoryRow> {
         memory_type: r.get("memory_type")?,
         metadata,
         created_at: r.get::<_, Option<f64>>("created_at")?.unwrap_or(0.0),
-        created_at_iso: r.get::<_, Option<String>>("created_at_iso")?.unwrap_or_default(),
+        created_at_iso: r
+            .get::<_, Option<String>>("created_at_iso")?
+            .unwrap_or_default(),
         updated_at: r.get::<_, Option<f64>>("updated_at")?.unwrap_or(0.0),
-        updated_at_iso: r.get::<_, Option<String>>("updated_at_iso")?.unwrap_or_default(),
+        updated_at_iso: r
+            .get::<_, Option<String>>("updated_at_iso")?
+            .unwrap_or_default(),
     })
 }
 
@@ -497,8 +498,7 @@ pub fn soft_delete(conn: &Connection, filter: &DeleteFilter, dry_run: bool) -> R
     let update_sql = format!("UPDATE memories SET deleted_at = ? WHERE {where_clause}");
     let mut update_binds: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(now)];
     update_binds.extend(binds);
-    let update_refs: Vec<&dyn rusqlite::ToSql> =
-        update_binds.iter().map(|b| b.as_ref()).collect();
+    let update_refs: Vec<&dyn rusqlite::ToSql> = update_binds.iter().map(|b| b.as_ref()).collect();
     conn.execute(&update_sql, update_refs.as_slice())?;
     Ok(hashes)
 }
@@ -554,4 +554,3 @@ pub fn list_memories(
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok((rows, total))
 }
-

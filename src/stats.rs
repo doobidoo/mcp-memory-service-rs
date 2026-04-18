@@ -32,10 +32,8 @@ pub struct CacheStats {
 impl CacheStats {
     pub fn new() -> Self {
         let s = Self::default();
-        s.started_at_ms.store(
-            chrono::Utc::now().timestamp_millis(),
-            Ordering::Relaxed,
-        );
+        s.started_at_ms
+            .store(chrono::Utc::now().timestamp_millis(), Ordering::Relaxed);
         s
     }
 

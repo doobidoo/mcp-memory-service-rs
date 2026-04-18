@@ -33,6 +33,30 @@ cargo build --release
 ./target/release/mcp-memory-service-rs serve
 ```
 
+## Benchmarks
+
+Sequential stdio MCP workload, 100 stores + 100 retrieves each, fresh DB per run, ONNX model already cached on disk. Measured on an Apple Silicon Mac, single client, no concurrency.
+
+| Metric        | Python upstream | Rust port   | Ratio            |
+|---------------|-----------------|-------------|------------------|
+| cold-start    | 4475 ms         | **123 ms**  | **36× faster**   |
+| RSS (live)    | 576 MB          | **242 MB**  | **2.4× smaller** |
+| store p50     | 13.7 ms         | 12.5 ms     | 1.1× faster      |
+| store p95     | 43.0 ms         | 29.5 ms     | 1.5× faster      |
+| retrieve p50  | **6.8 ms**      | 22.6 ms     | 0.3× (Rust slower) |
+| retrieve p95  | **8.5 ms**      | 36.4 ms     | 0.2× (Rust slower) |
+
+The retrieve regression is tracked — current suspect is the 3× KNN oversampling we do to guarantee `n_results` alive rows even when some matches are soft-deleted. Reproduce locally with `scripts/bench.py`.
+
+## Parity with upstream
+
+Two test suites verify Rust ↔ Python compatibility:
+
+- `scripts/parity_check.py` — **4/4** embedding fixtures agree to 4 decimals, L2 norm = 1.0 on both sides.
+- `scripts/m4_parity.py` — **23/23** storage assertions pass: list / search / retrieve ordering / pagination / tag case sensitivity / delete dry-run / soft-delete filter / health fields against a fresh DB populated by the Python writer.
+
+Both suites run on every push via GitHub Actions (`.github/workflows/ci.yml`).
+
 ## License
 
 This Rust port is dual-licensed:

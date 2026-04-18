@@ -1,11 +1,11 @@
 use std::sync::Arc;
 
 use rmcp::{
-    ErrorData, ServerHandler, ServiceExt,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{CallToolResult, Content, Implementation, ServerCapabilities, ServerInfo},
     tool, tool_handler, tool_router,
     transport::io::stdio,
+    ErrorData, ServerHandler, ServiceExt,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
@@ -251,8 +251,8 @@ impl MemoryServer {
             emb.embed(&p.query).await.map_err(internal_err)?
         };
         let conn = self.conn.lock().await;
-        let hits = storage::knn_search(&conn, &query_emb, p.n_results.max(1))
-            .map_err(internal_err)?;
+        let hits =
+            storage::knn_search(&conn, &query_emb, p.n_results.max(1)).map_err(internal_err)?;
         let results: Vec<RetrievedMemory> = hits
             .into_iter()
             .map(|(mem, score)| RetrievedMemory {
@@ -293,9 +293,17 @@ impl MemoryServer {
     ) -> std::result::Result<CallToolResult, ErrorData> {
         self.stats.record(|s| &s.delete_count);
         let mode = TagMatch::parse(&p.tag_match);
-        let before = p.before.as_deref().map(storage::parse_time).transpose()
+        let before = p
+            .before
+            .as_deref()
+            .map(storage::parse_time)
+            .transpose()
             .map_err(internal_err)?;
-        let after = p.after.as_deref().map(storage::parse_time).transpose()
+        let after = p
+            .after
+            .as_deref()
+            .map(storage::parse_time)
+            .transpose()
             .map_err(internal_err)?;
 
         // If no selectors were provided, refuse — matches Python's safety
@@ -501,8 +509,7 @@ fn strip_tags_from_metadata(mut v: serde_json::Value) -> serde_json::Value {
 }
 
 fn json_result<T: Serialize>(payload: &T) -> std::result::Result<CallToolResult, ErrorData> {
-    let json =
-        serde_json::to_string(payload).map_err(|e| internal_err(e.to_string()))?;
+    let json = serde_json::to_string(payload).map_err(|e| internal_err(e.to_string()))?;
     Ok(CallToolResult::success(vec![Content::text(json)]))
 }
 
@@ -510,8 +517,7 @@ fn json_result<T: Serialize>(payload: &T) -> std::result::Result<CallToolResult,
 impl ServerHandler for MemoryServer {
     fn get_info(&self) -> ServerInfo {
         let mut info = ServerInfo::default();
-        info.server_info =
-            Implementation::new(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
+        info.server_info = Implementation::new(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
         info.capabilities = ServerCapabilities::builder().enable_tools().build();
         info.instructions = Some(
             "Rust port of mcp-memory-service. All 8 M0–M3 tools wired: ping, store_memory, \
