@@ -77,6 +77,10 @@ fn apply_pragmas(conn: &Connection, config: &Config) -> Result<()> {
     Ok(())
 }
 
+// Schema MUST match the upstream Python `SqliteVecMemoryStorage` exactly so
+// both backends can share a DB file. Column names, virtual-table shape, and
+// indexes are all copied verbatim from
+// src/mcp_memory_service/storage/sqlite_vec.py.
 const SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS memories (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -92,7 +96,10 @@ CREATE TABLE IF NOT EXISTS memories (
     deleted_at      REAL DEFAULT NULL
 );
 
-CREATE INDEX IF NOT EXISTS idx_deleted_at ON memories(deleted_at);
+CREATE INDEX IF NOT EXISTS idx_content_hash ON memories(content_hash);
+CREATE INDEX IF NOT EXISTS idx_created_at  ON memories(created_at);
+CREATE INDEX IF NOT EXISTS idx_memory_type ON memories(memory_type);
+CREATE INDEX IF NOT EXISTS idx_deleted_at  ON memories(deleted_at);
 
 CREATE TABLE IF NOT EXISTS metadata (
     key   TEXT PRIMARY KEY,
@@ -100,8 +107,7 @@ CREATE TABLE IF NOT EXISTS metadata (
 );
 
 CREATE VIRTUAL TABLE IF NOT EXISTS memory_embeddings USING vec0(
-    content_hash TEXT PRIMARY KEY,
-    embedding FLOAT[384]
+    content_embedding FLOAT[384] distance_metric=cosine
 );
 "#;
 
@@ -218,9 +224,12 @@ pub fn insert_memory(
     let mem_id: i64 = tx.last_insert_rowid();
 
     let embedding_bytes = bytemuck_f32_slice_as_bytes(embedding);
+    // Python stores vectors under `memories.id` as `rowid` — we must do the
+    // same or the JOIN in knn_search won't find anything. `memories.id` is an
+    // INTEGER PRIMARY KEY AUTOINCREMENT, which SQLite aliases to rowid.
     tx.execute(
-        "INSERT INTO memory_embeddings (content_hash, embedding) VALUES (?1, ?2)",
-        params![row.content_hash, embedding_bytes],
+        "INSERT INTO memory_embeddings (rowid, content_embedding) VALUES (?1, ?2)",
+        params![mem_id, embedding_bytes],
     )?;
     tx.commit()?;
     Ok(Some(mem_id))
@@ -304,32 +313,35 @@ pub fn knn_search(
         )));
     }
     let q_bytes = bytemuck_f32_slice_as_bytes(query_embedding);
+    // We declared the vec0 table with `distance_metric=cosine`, so the
+    // returned `distance` is cosine distance (1 - cos) directly. Similarity
+    // is simply `1 - distance`. Oversample 3x then truncate after the
+    // soft-delete filter so KNN never gives us fewer than n_results alive
+    // rows when some matches are tombstoned.
     let mut stmt = conn.prepare(
         "SELECT m.content, m.content_hash, m.tags, m.memory_type, m.metadata,
                 m.created_at, m.created_at_iso, m.updated_at, m.updated_at_iso,
-                e.distance
-           FROM memory_embeddings e
-           JOIN memories m ON m.content_hash = e.content_hash
-          WHERE e.embedding MATCH ?1
+                me.distance
+           FROM memory_embeddings me
+           JOIN memories m ON m.rowid = me.rowid
+          WHERE me.content_embedding MATCH ?1
             AND m.deleted_at IS NULL
             AND k = ?2
-          ORDER BY e.distance",
+          ORDER BY me.distance",
     )?;
+    let oversample = (n_results as i64).saturating_mul(3).max(n_results as i64);
     let rows = stmt
-        .query_map(params![q_bytes, n_results as i64], |r| {
+        .query_map(params![q_bytes, oversample], |r| {
             let distance: f32 = r.get("distance")?;
             let mem = row_from_sqlite(r)?;
             Ok((mem, distance))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
 
-    // sqlite-vec returns L2 distance on packed f32[]. For L2-normalized unit
-    // vectors, |a - b|^2 = 2 - 2*cos(a,b), so cos = 1 - d^2/2. Range is
-    // [-1, 1]. Python returns raw cosine (no clamp); match that so parity
-    // tests against the upstream Python backend agree to 3-4 decimals.
     let out = rows
         .into_iter()
-        .map(|(m, d)| (m, 1.0 - (d * d) / 2.0))
+        .take(n_results)
+        .map(|(m, d)| (m, 1.0 - d))
         .collect();
     Ok(out)
 }
