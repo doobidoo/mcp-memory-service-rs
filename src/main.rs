@@ -8,6 +8,7 @@ mod config;
 mod embeddings;
 mod error;
 mod server;
+mod stats;
 mod storage;
 
 use config::Config;
@@ -72,12 +73,15 @@ async fn main() -> Result<()> {
 }
 
 async fn run_embed(text: &str) -> Result<()> {
+    let config = Config::from_env().context("config")?;
     let t0 = std::time::Instant::now();
-    let mut embedder = embeddings::Embedder::load().await.context("load model")?;
+    let mut embedder = embeddings::Embedder::load(&config)
+        .await
+        .context("load model")?;
     let load_ms = t0.elapsed().as_millis();
 
     let t1 = std::time::Instant::now();
-    let vec = embedder.embed(text).context("embed")?;
+    let vec = embedder.embed(text).await.context("embed")?;
     let embed_ms = t1.elapsed().as_millis();
 
     let norm = vec.iter().map(|v| v * v).sum::<f32>().sqrt();

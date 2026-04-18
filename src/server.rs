@@ -10,17 +10,20 @@ use rmcp::{
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
+use std::sync::atomic::Ordering;
+
 use crate::config::Config;
 use crate::embeddings::Embedder;
+use crate::stats::CacheStats;
 use crate::storage::{self, DeleteFilter, MemoryRow, TagMatch};
 
 pub struct MemoryServer {
     #[allow(dead_code)]
     tool_router: ToolRouter<Self>,
-    #[allow(dead_code)]
     config: Arc<Config>,
     conn: Arc<Mutex<rusqlite::Connection>>,
     embedder: Arc<Mutex<Embedder>>,
+    stats: Arc<CacheStats>,
 }
 
 // ---------- ping ----------
@@ -156,6 +159,16 @@ pub struct ListMemoriesResult {
     pub has_more: bool,
 }
 
+// ---------- check_database_health ----------
+
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
+pub struct CheckHealthParams {}
+
+// ---------- get_cache_stats ----------
+
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
+pub struct GetCacheStatsParams {}
+
 // ---------- impl ----------
 
 #[tool_router]
@@ -164,12 +177,14 @@ impl MemoryServer {
         config: Arc<Config>,
         conn: rusqlite::Connection,
         embedder: Embedder,
+        stats: Arc<CacheStats>,
     ) -> Self {
         Self {
             tool_router: Self::tool_router(),
             config,
             conn: Arc::new(Mutex::new(conn)),
             embedder: Arc::new(Mutex::new(embedder)),
+            stats,
         }
     }
 
@@ -181,6 +196,7 @@ impl MemoryServer {
         &self,
         Parameters(_): Parameters<PingParams>,
     ) -> std::result::Result<CallToolResult, ErrorData> {
+        self.stats.record(|s| &s.ping_count);
         let conn = self.conn.lock().await;
         let vec_version = storage::vec_version(&conn).map_err(internal_err)?;
         let memory_count = storage::count_memories(&conn).map_err(internal_err)?;
@@ -201,13 +217,14 @@ impl MemoryServer {
         &self,
         Parameters(p): Parameters<StoreMemoryParams>,
     ) -> std::result::Result<CallToolResult, ErrorData> {
+        self.stats.record(|s| &s.store_count);
         let tags = normalize_tags(p.tags.as_ref(), p.metadata.as_ref());
         let metadata = strip_tags_from_metadata(p.metadata.unwrap_or(serde_json::Value::Null));
 
         let row = storage::new_memory_row(p.content.clone(), tags, Some(p.memory_type), metadata);
         let embedding = {
             let mut emb = self.embedder.lock().await;
-            emb.embed(&p.content).map_err(internal_err)?
+            emb.embed(&p.content).await.map_err(internal_err)?
         };
 
         let conn = self.conn.lock().await;
@@ -228,9 +245,10 @@ impl MemoryServer {
         &self,
         Parameters(p): Parameters<RetrieveMemoryParams>,
     ) -> std::result::Result<CallToolResult, ErrorData> {
+        self.stats.record(|s| &s.retrieve_count);
         let query_emb = {
             let mut emb = self.embedder.lock().await;
-            emb.embed(&p.query).map_err(internal_err)?
+            emb.embed(&p.query).await.map_err(internal_err)?
         };
         let conn = self.conn.lock().await;
         let hits = storage::knn_search(&conn, &query_emb, p.n_results.max(1))
@@ -255,6 +273,7 @@ impl MemoryServer {
         &self,
         Parameters(p): Parameters<SearchByTagParams>,
     ) -> std::result::Result<CallToolResult, ErrorData> {
+        self.stats.record(|s| &s.search_count);
         let mode = TagMatch::parse(&p.tag_match);
         let conn = self.conn.lock().await;
         let rows = storage::search_by_tag(&conn, &p.tags, mode, p.memory_type.as_deref())
@@ -272,6 +291,7 @@ impl MemoryServer {
         &self,
         Parameters(p): Parameters<DeleteMemoryParams>,
     ) -> std::result::Result<CallToolResult, ErrorData> {
+        self.stats.record(|s| &s.delete_count);
         let mode = TagMatch::parse(&p.tag_match);
         let before = p.before.as_deref().map(storage::parse_time).transpose()
             .map_err(internal_err)?;
@@ -320,6 +340,7 @@ impl MemoryServer {
         &self,
         Parameters(p): Parameters<ListMemoriesParams>,
     ) -> std::result::Result<CallToolResult, ErrorData> {
+        self.stats.record(|s| &s.list_count);
         let conn = self.conn.lock().await;
         let (rows, total) = storage::list_memories(
             &conn,
@@ -346,6 +367,92 @@ impl MemoryServer {
             has_more,
         };
         json_result(&result)
+    }
+
+    #[tool(
+        name = "check_database_health",
+        description = "Database connectivity + configuration snapshot: backend type, memory \
+                       counts, file sizes, sqlite-vec version."
+    )]
+    async fn check_database_health(
+        &self,
+        Parameters(_): Parameters<CheckHealthParams>,
+    ) -> std::result::Result<CallToolResult, ErrorData> {
+        self.stats.record(|s| &s.health_count);
+        let conn = self.conn.lock().await;
+        let alive = storage::total_memories_alive(&conn).map_err(internal_err)?;
+        let total = storage::total_memories_including_deleted(&conn).map_err(internal_err)?;
+        let vec_version = storage::vec_version(&conn).map_err(internal_err)?;
+        let size = storage::db_size_bytes(&self.config.db_path);
+        let wal_size = storage::wal_size_bytes(&self.config.db_path);
+
+        let payload = serde_json::json!({
+            "status": "healthy",
+            "backend": "sqlite_vec_rs",
+            "total_memories": alive,
+            "database_info": {
+                "path": self.config.db_path.display().to_string(),
+                "size_bytes": size,
+                "wal_size_bytes": wal_size,
+                "soft_deleted_count": total - alive,
+                "vec_version": vec_version,
+                "embedding_model": crate::embeddings::MODEL_NAME,
+                "embedding_dim": crate::embeddings::EMBEDDING_DIM,
+            },
+            "timestamp": chrono::Utc::now().to_rfc3339(),
+        });
+        json_result(&payload)
+    }
+
+    #[tool(
+        name = "get_cache_stats",
+        description = "Return call counters and init timings, wrapped in a shape compatible \
+                       with the upstream Python tool so clients don't need to branch."
+    )]
+    async fn get_cache_stats(
+        &self,
+        Parameters(_): Parameters<GetCacheStatsParams>,
+    ) -> std::result::Result<CallToolResult, ErrorData> {
+        self.stats.record(|s| &s.stats_count);
+        let s = &self.stats;
+        let total_calls = s.total_calls.load(Ordering::Relaxed);
+        let embed_ms = s.embed_load_ms.load(Ordering::Relaxed);
+        let db_ms = s.db_init_ms.load(Ordering::Relaxed);
+        let uptime = s.uptime_seconds();
+
+        // Rust has no cache-miss path — every call hits the live in-process
+        // singleton. We fake the nested `storage_cache` / `service_cache`
+        // buckets with hits == total_calls so scripts that grep those
+        // fields keep working; documented in SPEC §11-Q5.
+        let payload = serde_json::json!({
+            "total_calls": total_calls,
+            "hit_rate": 1.0,
+            "storage_cache": {"hits": total_calls, "misses": 0, "size": 1},
+            "service_cache": {"hits": total_calls, "misses": 0, "size": 1},
+            "performance": {
+                "avg_init_ms": embed_ms,
+                "min_init_ms": db_ms,
+                "max_init_ms": embed_ms.max(db_ms),
+            },
+            "per_tool": {
+                "ping": s.ping_count.load(Ordering::Relaxed),
+                "store_memory": s.store_count.load(Ordering::Relaxed),
+                "retrieve_memory": s.retrieve_count.load(Ordering::Relaxed),
+                "search_by_tag": s.search_count.load(Ordering::Relaxed),
+                "delete_memory": s.delete_count.load(Ordering::Relaxed),
+                "list_memories": s.list_count.load(Ordering::Relaxed),
+                "check_database_health": s.health_count.load(Ordering::Relaxed),
+                "get_cache_stats": s.stats_count.load(Ordering::Relaxed),
+            },
+            "uptime_seconds": uptime,
+            "backend_info": {
+                "backend": "sqlite_vec_rs",
+                "db_path": self.config.db_path.display().to_string(),
+                "model": crate::embeddings::MODEL_NAME,
+                "embedding_dim": crate::embeddings::EMBEDDING_DIM,
+            },
+        });
+        json_result(&payload)
     }
 }
 
@@ -407,9 +514,9 @@ impl ServerHandler for MemoryServer {
             Implementation::new(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
         info.capabilities = ServerCapabilities::builder().enable_tools().build();
         info.instructions = Some(
-            "Rust port of mcp-memory-service. M2 wired: ping, store_memory, retrieve_memory, \
-             search_by_tag, delete_memory, list_memories. Remaining tools \
-             (check_database_health, get_cache_stats) arrive in M3."
+            "Rust port of mcp-memory-service. All 8 M0–M3 tools wired: ping, store_memory, \
+             retrieve_memory, search_by_tag, delete_memory, list_memories, \
+             check_database_health, get_cache_stats."
                 .into(),
         );
         info
@@ -421,12 +528,22 @@ fn internal_err(e: impl std::fmt::Display) -> ErrorData {
 }
 
 pub async fn run_stdio(config: Config) -> crate::error::Result<()> {
-    tracing::info!("loading embedding model (first run downloads ~80MB)");
-    let embedder = Embedder::load().await?;
-    tracing::info!("embedding model ready");
+    let stats = Arc::new(CacheStats::new());
 
+    tracing::info!("loading embedding model (first run downloads ~80MB)");
+    let t0 = std::time::Instant::now();
+    let embedder = Embedder::load(&config).await?;
+    stats.set_embed_load_ms(t0.elapsed().as_millis() as u64);
+    tracing::info!(
+        embed_load_ms = stats.embed_load_ms.load(Ordering::Relaxed),
+        "embedding model ready"
+    );
+
+    let t1 = std::time::Instant::now();
     let conn = storage::open(&config)?;
-    let server = MemoryServer::new(Arc::new(config), conn, embedder);
+    stats.set_db_init_ms(t1.elapsed().as_millis() as u64);
+
+    let server = MemoryServer::new(Arc::new(config), conn, embedder, stats);
     let service = server
         .serve(stdio())
         .await

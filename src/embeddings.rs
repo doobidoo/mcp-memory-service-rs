@@ -1,8 +1,13 @@
-//! ONNX embedding generation for the `all-MiniLM-L6-v2` model.
+//! Embedding generation for mcp-memory-service.
 //!
-//! Port of `src/mcp_memory_service/embeddings/onnx_embeddings.py`. Semantics
-//! match exactly so embeddings from the Python server and this Rust server
-//! are byte-compatible for the same input.
+//! Two backends, selected via `Config::embedding_backend`:
+//!   * ONNX (default): local `all-MiniLM-L6-v2` via `ort`. Port of
+//!     `src/mcp_memory_service/embeddings/onnx_embeddings.py` with
+//!     bitwise-identical output (verified by `scripts/parity_check.py`).
+//!   * External: POST to any OpenAI-compatible `/v1/embeddings` endpoint
+//!     (vLLM, Ollama, TEI, OpenAI itself). Response embeddings are
+//!     L2-normalized here so downstream cosine math stays correct even
+//!     if the remote model doesn't normalize.
 
 use std::fs;
 use std::io::Write;
@@ -13,6 +18,7 @@ use ort::{
     session::{Session, builder::GraphOptimizationLevel},
     value::{Tensor, Value},
 };
+use serde::Deserialize;
 
 fn build_session(model_path: &Path) -> Result<Session> {
     Session::builder()
@@ -30,6 +36,7 @@ fn num_cpus_one() -> usize {
 use sha2::{Digest, Sha256};
 use tokenizers::Tokenizer;
 
+use crate::config::{Config, EmbeddingBackend};
 use crate::error::{AppError, Result};
 
 pub const MODEL_NAME: &str = "all-MiniLM-L6-v2";
@@ -39,12 +46,43 @@ const MODEL_URL: &str =
 const MODEL_SHA256: &str =
     "913d7300ceae3b2dbc2c50d1de4baacab4be7b9380491c27fab7418616a16ec3";
 
-pub struct Embedder {
+pub enum Embedder {
+    Onnx(OnnxEmbedder),
+    External(ExternalEmbedder),
+}
+
+impl Embedder {
+    /// Dispatch based on `config.embedding_backend`. The ONNX path downloads
+    /// the model on first call; the external path just builds an HTTP client.
+    pub async fn load(config: &Config) -> Result<Self> {
+        match config.embedding_backend {
+            EmbeddingBackend::Onnx => Ok(Self::Onnx(OnnxEmbedder::load().await?)),
+            EmbeddingBackend::External => Ok(Self::External(ExternalEmbedder::new(config)?)),
+        }
+    }
+
+    pub async fn embed(&mut self, text: &str) -> Result<Vec<f32>> {
+        match self {
+            Self::Onnx(e) => e.embed(text),
+            Self::External(e) => e.embed(text).await,
+        }
+    }
+
+    #[allow(dead_code)] // reserved for future batch-store path
+    pub async fn embed_batch(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+        match self {
+            Self::Onnx(e) => e.embed_batch(texts),
+            Self::External(e) => e.embed_batch(texts).await,
+        }
+    }
+}
+
+pub struct OnnxEmbedder {
     session: Session,
     tokenizer: Tokenizer,
 }
 
-impl Embedder {
+impl OnnxEmbedder {
     /// Load the model, downloading and extracting it on first use.
     /// The cache path mirrors the Python implementation exactly, so both
     /// servers share the same on-disk cache.
@@ -233,6 +271,115 @@ fn verify_sha256(path: &Path, expected_hex: &str) -> Result<bool> {
     hasher.update(&bytes);
     let got = hex::encode(hasher.finalize());
     Ok(got.eq_ignore_ascii_case(expected_hex))
+}
+
+pub struct ExternalEmbedder {
+    client: reqwest::Client,
+    url: String,
+    api_key: Option<String>,
+    model: String,
+}
+
+#[derive(Deserialize)]
+struct ExternalResponse {
+    data: Vec<ExternalEmbedding>,
+}
+
+#[derive(Deserialize)]
+struct ExternalEmbedding {
+    embedding: Vec<f32>,
+}
+
+impl ExternalEmbedder {
+    pub fn new(config: &Config) -> Result<Self> {
+        let url = config
+            .external_api_url
+            .clone()
+            .ok_or_else(|| AppError::Config(
+                "MCP_EXTERNAL_EMBEDDING_API_URL is required when MCP_EMBEDDING_BACKEND=external"
+                    .into(),
+            ))?;
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .map_err(|e| AppError::Config(format!("http client: {e}")))?;
+        Ok(Self {
+            client,
+            url,
+            api_key: config.external_api_key.clone(),
+            model: config.external_model.clone(),
+        })
+    }
+
+    pub async fn embed(&self, text: &str) -> Result<Vec<f32>> {
+        let mut out = self.embed_batch(&[text]).await?;
+        Ok(out.pop().expect("non-empty batch"))
+    }
+
+    pub async fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+        let body = serde_json::json!({
+            "model": self.model,
+            "input": texts,
+        });
+
+        let mut req = self.client.post(&self.url).json(&body);
+        if let Some(key) = &self.api_key {
+            req = req.bearer_auth(key);
+        }
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| AppError::Config(format!("external embedding request: {e}")))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(AppError::Config(format!(
+                "external embedding HTTP {status}: {}",
+                body.chars().take(400).collect::<String>()
+            )));
+        }
+
+        let parsed: ExternalResponse = resp
+            .json()
+            .await
+            .map_err(|e| AppError::Config(format!("external embedding parse: {e}")))?;
+
+        if parsed.data.len() != texts.len() {
+            return Err(AppError::Config(format!(
+                "external embedding returned {} rows, expected {}",
+                parsed.data.len(),
+                texts.len()
+            )));
+        }
+
+        let out: Vec<Vec<f32>> = parsed
+            .data
+            .into_iter()
+            .map(|e| {
+                if e.embedding.len() != EMBEDDING_DIM {
+                    return Err(AppError::Config(format!(
+                        "external embedding dim {} != schema dim {EMBEDDING_DIM}. \
+                         Pick a model that returns {EMBEDDING_DIM}-d vectors or migrate \
+                         the schema (not yet supported).",
+                        e.embedding.len()
+                    )));
+                }
+                // Remote model may not normalize — ensure unit length here so
+                // the cosine conversion in storage::knn_search stays valid.
+                let mut v = e.embedding;
+                let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-12);
+                for x in &mut v {
+                    *x /= norm;
+                }
+                Ok(v)
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok(out)
+    }
 }
 
 fn extract_tarball(archive: &Path, dest: &Path) -> Result<()> {

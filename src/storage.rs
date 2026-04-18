@@ -131,6 +131,26 @@ pub fn db_size_bytes(path: &Path) -> u64 {
     std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
 }
 
+/// Size of the `-wal` sidecar file, if present. Returns 0 when WAL mode is
+/// inactive or the file has been checkpointed away.
+pub fn wal_size_bytes(db_path: &Path) -> u64 {
+    let mut wal = db_path.as_os_str().to_os_string();
+    wal.push("-wal");
+    std::fs::metadata(Path::new(&wal))
+        .map(|m| m.len())
+        .unwrap_or(0)
+}
+
+pub fn total_memories_alive(conn: &Connection) -> Result<i64> {
+    count_memories(conn)
+}
+
+/// Row count including soft-deleted entries — useful for debugging.
+pub fn total_memories_including_deleted(conn: &Connection) -> Result<i64> {
+    let n: i64 = conn.query_row("SELECT COUNT(*) FROM memories", [], |row| row.get(0))?;
+    Ok(n)
+}
+
 /// SHA256 hex of content — deterministic across Python/Rust.
 pub fn content_hash(content: &str) -> String {
     use sha2::{Digest, Sha256};
