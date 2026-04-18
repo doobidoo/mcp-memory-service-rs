@@ -304,13 +304,12 @@ pub fn knn_search(
         .collect::<rusqlite::Result<Vec<_>>>()?;
 
     // sqlite-vec returns L2 distance on packed f32[]. For L2-normalized unit
-    // vectors, |a - b|^2 = 2 - 2*cos(a,b), so cos = 1 - d^2/2.
+    // vectors, |a - b|^2 = 2 - 2*cos(a,b), so cos = 1 - d^2/2. Range is
+    // [-1, 1]. Python returns raw cosine (no clamp); match that so parity
+    // tests against the upstream Python backend agree to 3-4 decimals.
     let out = rows
         .into_iter()
-        .map(|(m, d)| {
-            let cos = (1.0 - (d * d) / 2.0).clamp(0.0, 1.0);
-            (m, cos)
-        })
+        .map(|(m, d)| (m, 1.0 - (d * d) / 2.0))
         .collect();
     Ok(out)
 }
