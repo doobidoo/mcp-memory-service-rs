@@ -35,4 +35,9 @@ cargo build --release
 
 ## License
 
-MIT. Same as the upstream Python project.
+This Rust port is dual-licensed:
+
+- **Noncommercial use** — free under the [PolyForm Noncommercial License 1.0.0](LICENSE). Personal projects, research, academic and hobby work, and use by noncommercial organizations are covered. No further permission needed.
+- **Commercial use** — requires a separate commercial license. See [COMMERCIAL.md](COMMERCIAL.md) for scope and contact. Email `henry.krupp@gmail.com`.
+
+The upstream Python project [`doobidoo/mcp-memory-service`](https://github.com/doobidoo/mcp-memory-service) remains under Apache-2.0 — this port's license choice does not affect it.

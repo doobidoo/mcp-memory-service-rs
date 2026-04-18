@@ -3,8 +3,8 @@ name = "mcp-memory-service"
 version = "0.1.0"
 edition = "2021"
 description = "Schema-compatible Rust drop-in for the core tools of mcp-memory-service"
-license = "MIT"
-readme = "SPEC.md"
+license = "PolyForm-Noncommercial-1.0.0"
+readme = "README.md"
 
 [[bin]]
 name = "mcp-memory-service-rs"
