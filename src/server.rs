@@ -250,7 +250,9 @@ impl MemoryServer {
         // (skipped by the Option branch). Left in because retrieve is the
         // metric we're most sensitive about vs the Python upstream — any
         // regression in this tool is a real concern.
-        let profile_t0 = std::env::var("MMS_PROFILE").is_ok().then(std::time::Instant::now);
+        let profile_t0 = std::env::var("MMS_PROFILE")
+            .is_ok()
+            .then(std::time::Instant::now);
         let query_emb = {
             let mut emb = self.embedder.lock().await;
             emb.embed(&p.query).await.map_err(internal_err)?
